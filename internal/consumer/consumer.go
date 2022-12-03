@@ -7,12 +7,67 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
+	"time"
 	"github.com/Shopify/sarama"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	log "github.com/sirupsen/logrus"
 )
+
+type item struct {
+    value      string
+    lastAccess int64
+}
+
+type TTLMap struct {
+    m map[string]*item
+    l sync.Mutex
+}
+
+func NewTTLMap( maxTTL int) (m *TTLMap) {
+    m = &TTLMap{m: make(map[string]*item)}
+    go func() {
+        for now := range time.Tick(time.Second) {
+            m.l.Lock()
+            for k, v := range m.m {
+                if now.Unix() - v.lastAccess > int64(maxTTL) {
+                    delete(m.m, k)
+                }
+            }
+            m.l.Unlock()
+        }
+    }()
+    return
+}
+
+func (m *TTLMap) Len() int {
+    return len(m.m)
+}
+
+func (m *TTLMap) Put(k, v string) {
+    m.l.Lock()
+    it, ok := m.m[k]
+    if !ok {
+        it = &item{value: v}
+        m.m[k] = it
+    }
+    it.lastAccess = time.Now().Unix()
+    m.l.Unlock()
+}
+
+func (m *TTLMap) Get(k string) (v string) {
+    m.l.Lock()
+    if it, ok := m.m[k]; ok {
+        v = it.value
+        it.lastAccess = time.Now().Unix()
+    }
+    m.l.Unlock()
+    return
+
+}
+
+
+
 
 var (
 	flowReceiveBytesTotal = promauto.NewCounterVec(
@@ -30,6 +85,25 @@ var (
 		},
 		[]string{"source_as", "source_as_name", "destination_as", "destination_as_name", "hostname"},
 	)
+	usersIn24Hours = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "users_in_last_24_hours",
+			Help: "Users in Past 24 Hours",
+		},
+		[]string{"hostname"},
+	)
+	cache24h = make(map[string]*TTLMap)
+
+	usersIn1Hour = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "users_in_last_1_hours",
+			Help: "Users in Past Hour",
+		},
+		[]string{"hostname"},
+	)
+	cache1h = make(map[string]*TTLMap)
+
+
 )
 
 type flow struct {
@@ -134,6 +208,56 @@ func logFlow(message sarama.ConsumerMessage, asns map[int]string, asn int) {
 				"hostname":            f.Hostname,
 			},
 		).Add(float64(f.Bytes))
+		
+		_, isPresent := cache24h[f.Hostname]
+		if !isPresent {
+			cache24h[f.Hostname] = NewTTLMap(3600 * 24)
+		}
+
+		_, isPresent = cache1h[f.Hostname]
+		if !isPresent {
+			cache1h[f.Hostname] = NewTTLMap(3600)
+		}
+		 
+		cache24h[f.Hostname].Put(f.SourceIP, f.Hostname)
+		usersIn24Hours.With(
+			prometheus.Labels{
+				"hostname":           f.Hostname,
+			},
+		).Set(float64(cache24h[f.Hostname].Len()))
+
+		cache1h[f.Hostname].Put(f.SourceIP, f.Hostname)
+		usersIn1Hour.With(
+			prometheus.Labels{
+				"hostname":           f.Hostname,
+			},
+		).Set(float64(cache1h[f.Hostname].Len()))
+
+		f.Hostname = "combined"
+		_, isPresent = cache24h[f.Hostname]
+		if !isPresent {
+			cache24h[f.Hostname] = NewTTLMap(3600 * 24)
+		}
+
+		_, isPresent = cache1h[f.Hostname]
+		if !isPresent {
+			cache1h[f.Hostname] = NewTTLMap(3600)
+		}
+		 
+		cache24h[f.Hostname].Put(f.SourceIP, f.Hostname)
+		usersIn24Hours.With(
+			prometheus.Labels{
+				"hostname":           f.Hostname,
+			},
+		).Set(float64(cache24h[f.Hostname].Len()))
+
+		cache1h[f.Hostname].Put(f.SourceIP, f.Hostname)
+		usersIn1Hour.With(
+			prometheus.Labels{
+				"hostname":           f.Hostname,
+			},
+		).Set(float64(cache1h[f.Hostname].Len()))
+
 	} else if f.DestinationAS == asn {
 		flowReceiveBytesTotal.With(
 			prometheus.Labels{
